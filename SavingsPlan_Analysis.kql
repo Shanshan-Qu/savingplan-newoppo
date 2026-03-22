@@ -1,0 +1,306 @@
+// ============================================================================
+// Z-Energy – Azure Compute Savings Plan Opportunity Analysis
+// ============================================================================
+// PURPOSE:
+//   Analyse Pay-As-You-Go (PAYG/OnDemand) compute spend from Azure Cost
+//   Management exports and model potential Savings Plan savings.
+//
+// DATA SOURCE (choose one):
+//   A) Azure Cost Management export → Storage Account → Azure Data Explorer (ADX)
+//   B) Cost Management export → Log Analytics workspace (amortised cost table)
+//   C) Microsoft Cost Management Power BI connector → ADX ingestion
+//
+// EXPECTED TABLE SCHEMA (standard Cost Management export):
+//   BillingPeriodStartDate, UsageDateTime (date), ResourceId, ResourceGroupName,
+//   MeterCategory, MeterSubCategory, MeterName, Quantity, UnitPrice,
+//   CostInBillingCurrency, Currency, PricingModel, ReservationId,
+//   ReservationName, PublisherType, ServiceName, ServiceTier
+//
+// Adjust the table name and column names to match your export schema.
+// ============================================================================
+
+// ── CONFIGURATION – Update these variables ───────────────────────────────────
+let LookbackDays        = 30;     // Days of history to analyse
+let CostTableName       = "CostDetails";  // Your exported cost table name
+let CurrencySymbol      = "AUD";
+let Discount_1Yr        = 0.37;   // ~37% saving for 1-Year Compute SP
+let Discount_3Yr        = 0.52;   // ~52% saving for 3-Year Compute SP
+
+// Meter categories eligible for Azure Compute Savings Plans
+let ComputeCategories   = dynamic([
+    "Virtual Machines",
+    "Azure Dedicated Host",
+    "Container Instances",
+    "Azure Kubernetes Service",
+    "Azure App Service",
+    "Azure Functions"
+]);
+
+// ── QUERY 1: Overall PAYG Compute Cost Summary ───────────────────────────────
+// Run this first to see the high-level picture.
+// ─────────────────────────────────────────────────────────────────────────────
+let StartDate = ago(30d);
+let EndDate   = now();
+
+CostDetails
+| where UsageDateTime between (StartDate .. EndDate)
+| where MeterCategory in (ComputeCategories)
+| where PricingModel in ("OnDemand", "PAYG", "")       // PAYG rows only
+| summarize
+    TotalPAYGCost       = round(sum(CostInBillingCurrency), 2),
+    AvgDailyCost        = round(avg(CostInBillingCurrency), 2),
+    UniqueResources     = dcount(ResourceId),
+    UniqueResourceGroups = dcount(ResourceGroupName)
+| extend
+    AvgHourlyCost       = round(TotalPAYGCost / (LookbackDays * 24), 2),
+    ProjectedAnnualCost = round(TotalPAYGCost / LookbackDays * 365, 2)
+| project
+    ["Period (Days)"]          = LookbackDays,
+    ["Total PAYG Compute"]     = TotalPAYGCost,
+    ["Avg Daily PAYG Compute"] = AvgDailyCost,
+    ["Avg Hourly PAYG Compute"]= AvgHourlyCost,
+    ["Projected Annual PAYG"]  = ProjectedAnnualCost,
+    ["Unique Resources"]       = UniqueResources,
+    ["Unique Resource Groups"] = UniqueResourceGroups
+
+// ── QUERY 2: Daily PAYG Compute Cost Trend ───────────────────────────────────
+// Shows day-by-day spend — helps identify baseline vs spiky workloads.
+// ─────────────────────────────────────────────────────────────────────────────
+CostDetails
+| where UsageDateTime between (ago(LookbackDays * 1d) .. now())
+| where MeterCategory in (ComputeCategories)
+| where PricingModel in ("OnDemand", "PAYG", "")
+| summarize DailyCost = round(sum(CostInBillingCurrency), 2) by Day = bin(UsageDateTime, 1d)
+| sort by Day asc
+| extend
+    RunningAvg     = round(series_fir(DailyCost, dynamic([1,1,1,1,1,1,1])) / 7, 2),  // 7-day moving avg
+    DayOfWeek      = dayofweek(Day)
+| project
+    Date           = format_datetime(Day, "yyyy-MM-dd"),
+    DailyCost,
+    ["7-Day Moving Avg"] = RunningAvg,
+    ["Day of Week"]      = DayOfWeek
+| render timechart
+    with (title = "PAYG Compute Daily Cost Trend", ytitle = strcat("Cost (", CurrencySymbol, ")"))
+
+// ── QUERY 3: PAYG Compute Cost Breakdown by Meter Category ───────────────────
+// Shows which compute services are driving PAYG spend.
+// ─────────────────────────────────────────────────────────────────────────────
+CostDetails
+| where UsageDateTime between (ago(LookbackDays * 1d) .. now())
+| where MeterCategory in (ComputeCategories)
+| where PricingModel in ("OnDemand", "PAYG", "")
+| summarize TotalCost = round(sum(CostInBillingCurrency), 2) by MeterCategory, MeterSubCategory
+| order by TotalCost desc
+| extend CumulativePct = round(100.0 * TotalCost / toscalar(
+    CostDetails
+    | where UsageDateTime between (ago(LookbackDays * 1d) .. now())
+    | where MeterCategory in (ComputeCategories)
+    | where PricingModel in ("OnDemand", "PAYG", "")
+    | summarize sum(CostInBillingCurrency)), 2)
+| project
+    MeterCategory,
+    MeterSubCategory,
+    ["Total Cost"]       = TotalCost,
+    ["% of Compute PAYG"] = CumulativePct
+| render piechart
+    with (title = "PAYG Compute Cost by Category")
+
+// ── QUERY 4: PAYG Compute by Resource Group ──────────────────────────────────
+// Top resource groups by PAYG compute spend — useful for scoping SP purchases.
+// ─────────────────────────────────────────────────────────────────────────────
+let TotalComputeCost =
+    CostDetails
+    | where UsageDateTime between (ago(LookbackDays * 1d) .. now())
+    | where MeterCategory in (ComputeCategories)
+    | where PricingModel in ("OnDemand", "PAYG", "")
+    | summarize sum(CostInBillingCurrency);
+
+CostDetails
+| where UsageDateTime between (ago(LookbackDays * 1d) .. now())
+| where MeterCategory in (ComputeCategories)
+| where PricingModel in ("OnDemand", "PAYG", "")
+| summarize TotalCost = round(sum(CostInBillingCurrency), 2) by ResourceGroupName
+| extend PctOfCompute = round(100.0 * TotalCost / toscalar(TotalComputeCost), 2)
+| top 20 by TotalCost desc
+| project
+    ["Resource Group"]   = ResourceGroupName,
+    ["PAYG Cost"]        = TotalCost,
+    ["% of Compute PAYG"]= PctOfCompute
+
+// ── QUERY 5: Current Coverage – PAYG vs Reservations vs Savings Plans ────────
+// Shows what portion of compute is already committed vs still on PAYG.
+// ─────────────────────────────────────────────────────────────────────────────
+CostDetails
+| where UsageDateTime between (ago(LookbackDays * 1d) .. now())
+| where MeterCategory in (ComputeCategories)
+| extend PricingTier = case(
+    PricingModel == "Reservation",  "Reservation",
+    PricingModel == "SavingsPlan",  "Savings Plan",
+    PricingModel in ("OnDemand", "PAYG", ""), "Pay-As-You-Go",
+    "Other")
+| summarize TotalCost = round(sum(CostInBillingCurrency), 2) by PricingTier
+| extend PctOfTotal = round(100.0 * TotalCost / toscalar(
+    CostDetails
+    | where UsageDateTime between (ago(LookbackDays * 1d) .. now())
+    | where MeterCategory in (ComputeCategories)
+    | summarize sum(CostInBillingCurrency)), 2)
+| project
+    ["Pricing Model"]    = PricingTier,
+    ["Total Cost"]       = TotalCost,
+    ["% of Compute"]     = PctOfTotal
+| render piechart
+    with (title = "Compute Cost by Pricing Model")
+
+// ── QUERY 6: Hourly Commitment Baseline Analysis ─────────────────────────────
+// Calculates percentile-based hourly baselines to determine a safe SP commitment.
+// Use the p30-p50 range as the commitment anchor to minimise wastage risk.
+// ─────────────────────────────────────────────────────────────────────────────
+let DailyCosts =
+    CostDetails
+    | where UsageDateTime between (ago(LookbackDays * 1d) .. now())
+    | where MeterCategory in (ComputeCategories)
+    | where PricingModel in ("OnDemand", "PAYG", "")
+    | summarize DailyCost = sum(CostInBillingCurrency) by Day = bin(UsageDateTime, 1d);
+
+DailyCosts
+| summarize
+    Days            = count(),
+    TotalCost       = round(sum(DailyCost), 2),
+    AvgDailyCost    = round(avg(DailyCost), 2),
+    MinDailyCost    = round(min(DailyCost), 2),
+    MaxDailyCost    = round(max(DailyCost), 2),
+    P30DailyCost    = round(percentile(DailyCost, 30), 2),   // Conservative commitment
+    P50DailyCost    = round(percentile(DailyCost, 50), 2),   // Moderate commitment
+    P70DailyCost    = round(percentile(DailyCost, 70), 2)    // Aggressive commitment
+| extend
+    P30HourlyCost   = round(P30DailyCost / 24, 4),
+    P50HourlyCost   = round(P50DailyCost / 24, 4),
+    P70HourlyCost   = round(P70DailyCost / 24, 4)
+| project
+    ["Lookback Days"]             = Days,
+    ["Avg Daily PAYG"]            = AvgDailyCost,
+    ["Min Daily PAYG"]            = MinDailyCost,
+    ["Max Daily PAYG"]            = MaxDailyCost,
+    ["P30 Daily (Conservative)"]  = P30DailyCost,
+    ["P50 Daily (Moderate)"]      = P50DailyCost,
+    ["P70 Daily (Aggressive)"]    = P70DailyCost,
+    ["P30 Hourly Commit"]         = P30HourlyCost,
+    ["P50 Hourly Commit"]         = P50HourlyCost,
+    ["P70 Hourly Commit"]         = P70HourlyCost
+
+// ── QUERY 7: Savings Plan Savings Model ──────────────────────────────────────
+// Models estimated annual savings for different hourly commitment levels.
+// Outputs a recommendation table.
+// ─────────────────────────────────────────────────────────────────────────────
+let DailyCosts2 =
+    CostDetails
+    | where UsageDateTime between (ago(LookbackDays * 1d) .. now())
+    | where MeterCategory in (ComputeCategories)
+    | where PricingModel in ("OnDemand", "PAYG", "")
+    | summarize DailyCost = sum(CostInBillingCurrency) by Day = bin(UsageDateTime, 1d);
+
+let Baselines =
+    DailyCosts2
+    | summarize
+        AvgHourly    = avg(DailyCost) / 24,
+        P30Hourly    = percentile(DailyCost, 30) / 24,
+        P50Hourly    = percentile(DailyCost, 50) / 24,
+        P70Hourly    = percentile(DailyCost, 70) / 24,
+        TotalCost    = sum(DailyCost);
+
+Baselines
+| extend AnnualPAYG = TotalCost / LookbackDays * 365
+| mv-expand CommitmentScenario = dynamic([
+    {"Label":"Conservative (P30)",  "HourlyFactor": "P30Hourly"},
+    {"Label":"Moderate (P50)",      "HourlyFactor": "P50Hourly"},
+    {"Label":"Aggressive (P70)",    "HourlyFactor": "P70Hourly"}
+])
+| extend
+    ScenarioLabel    = tostring(CommitmentScenario.Label),
+    HourlyCommit     = case(
+        tostring(CommitmentScenario.HourlyFactor) == "P30Hourly", P30Hourly,
+        tostring(CommitmentScenario.HourlyFactor) == "P50Hourly", P50Hourly,
+        P70Hourly)
+| extend
+    AnnualCommit     = round(HourlyCommit * 8760, 2),
+    CoveragePct      = round(100.0 * (HourlyCommit / AvgHourly), 2),
+    // Covered PAYG is what the SP commitment would replace
+    CoveredAnnual    = round(AnnualPAYG * (HourlyCommit / AvgHourly), 2)
+| extend
+    Saving_1Yr       = round(CoveredAnnual * Discount_1Yr, 2),
+    Saving_3Yr       = round(CoveredAnnual * Discount_3Yr, 2),
+    NetCost_1Yr      = round(AnnualCommit * (1 - Discount_1Yr), 2),
+    NetCost_3Yr      = round(AnnualCommit * (1 - Discount_3Yr), 2)
+| project
+    ["Scenario"]                     = ScenarioLabel,
+    ["Hourly Commitment (AUD/hr)"]   = round(HourlyCommit, 4),
+    ["Annual Commitment (AUD)"]      = AnnualCommit,
+    ["Coverage of PAYG Spend (%)"]   = CoveragePct,
+    ["Est. Annual Saving 1-Year"]    = Saving_1Yr,
+    ["Est. Annual Saving 3-Year"]    = Saving_3Yr,
+    ["Payback Period 1-Yr (months)"] = round(AnnualCommit / (Saving_1Yr / 12), 1),
+    ["Payback Period 3-Yr (months)"] = round(AnnualCommit / (Saving_3Yr / 12), 1)
+| render table
+
+// ── QUERY 8: Resources NOT Covered by Reservations or Savings Plans ───────────
+// Identifies specific VMs / resources on pure PAYG — candidates for coverage.
+// ─────────────────────────────────────────────────────────────────────────────
+CostDetails
+| where UsageDateTime between (ago(LookbackDays * 1d) .. now())
+| where MeterCategory in (ComputeCategories)
+| where PricingModel in ("OnDemand", "PAYG", "")
+| summarize
+    TotalCost        = round(sum(CostInBillingCurrency), 2),
+    AvgDailyCost     = round(avg(CostInBillingCurrency), 2),
+    DaysWithUsage    = dcount(bin(UsageDateTime, 1d)),
+    MeterCategory    = any(MeterCategory),
+    MeterSubCategory = any(MeterSubCategory)
+    by ResourceId, ResourceGroupName
+| extend
+    Consistency_Pct  = round(100.0 * DaysWithUsage / LookbackDays, 1),
+    // Flag resources running >80% of days as "high consistency" → good SP candidates
+    SPCandidate      = iff(DaysWithUsage >= (LookbackDays * 0.8), "✓ High", "Low")
+| top 50 by TotalCost desc
+| project
+    ["Resource ID"]        = ResourceId,
+    ["Resource Group"]     = ResourceGroupName,
+    ["Meter Category"]     = MeterCategory,
+    ["Meter Sub-Category"] = MeterSubCategory,
+    ["Total PAYG Cost"]    = TotalCost,
+    ["Avg Daily Cost"]     = AvgDailyCost,
+    ["Days Active"]        = DaysWithUsage,
+    ["Consistency"]        = Consistency_Pct,
+    ["SP Candidate"]       = SPCandidate
+| sort by ["Total PAYG Cost"] desc
+
+// ── QUERY 9: Weekday vs Weekend PAYG Compute Pattern ─────────────────────────
+// Helps identify workloads with weekend scale-down — factor in before committing.
+// ─────────────────────────────────────────────────────────────────────────────
+CostDetails
+| where UsageDateTime between (ago(LookbackDays * 1d) .. now())
+| where MeterCategory in (ComputeCategories)
+| where PricingModel in ("OnDemand", "PAYG", "")
+| extend DayType = iff(dayofweek(UsageDateTime) in (0d, 6d), "Weekend", "Weekday")
+| summarize
+    AvgDailyCost  = round(avg(CostInBillingCurrency), 2),
+    TotalCost     = round(sum(CostInBillingCurrency), 2),
+    Days          = dcount(bin(UsageDateTime, 1d))
+    by DayType
+| project
+    ["Day Type"]          = DayType,
+    ["Avg Daily Cost"]    = AvgDailyCost,
+    ["Total Cost"]        = TotalCost,
+    ["Days in Period"]    = Days
+
+// ── QUERY 10: Advisor Recommendations Cross-Reference ────────────────────────
+// If Azure Advisor recommendations are exported to the same ADX cluster,
+// cross-reference them here. Adjust table/column names as needed.
+// ─────────────────────────────────────────────────────────────────────────────
+// AzureAdvisorRecommendations
+// | where Category == "Cost"
+// | where ShortDescription contains "Savings Plan"
+// | project
+//     ResourceId, ImpactedField, AnnualSavingsAmount, Currency,
+//     RecommendationText = ShortDescription, LastUpdated = TimeStamp
+// | order by AnnualSavingsAmount desc
