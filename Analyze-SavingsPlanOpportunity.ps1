@@ -11,9 +11,13 @@
       3. Calls the BillingBenefits API to enumerate ALL active Savings Plan
          orders and their current hourly commitment amounts, filtered to those
          that apply to the given scope.
-      4. Calculates the GAP = (remaining PAYG baseline hourly rate) minus
+      4. Calls the Capacity API to enumerate ALL active Reservations (RIs),
+         filtered to those that apply to the given scope, with expiry warnings.
+      5. Calculates the GAP = (remaining PAYG baseline hourly rate) minus
          (existing active SP hourly commitment already applied to this scope).
-      5. Models additional SP purchase options based only on this gap.
+      6. Models additional SP purchase options based only on this gap.
+      7. Reports RI coverage breakdown by meter category and resource group,
+         and warns on RIs expiring within 90 / 180 days.
 
     Azure Compute Savings Plan covers: VMs, Azure Dedicated Hosts, Container
     Instances, AKS (compute portion), App Service Premium v3, Azure Functions
@@ -22,12 +26,14 @@
     Approximate discount rates vs PAYG:
         1-Year Compute Savings Plan : ~37%
         3-Year Compute Savings Plan : ~52%
+        1-Year VM Reservation       : ~40%  (varies by SKU and region)
+        3-Year VM Reservation       : ~60%  (varies by SKU and region)
 
 .PREREQUISITES
     Install-Module Az.Accounts -Scope CurrentUser -Force
 
 .PERMISSIONS
-    Two Azure RBAC roles are required:
+    Three Azure RBAC roles are required:
 
         Role 1 : Cost Management Reader
         Scope  : The subscription or management group passed as -BillingScope
@@ -40,9 +46,18 @@
                  Without this the script still runs but existing SP commitments
                  cannot be auto-detected (manual override available).
 
+        Role 3 : Reservations Reader  (or Owner/Contributor on the reservations,
+                 or Reader at the Enrollment/Billing Account scope)
+        Scope  : Tenant root  (/providers/Microsoft.Capacity/reservationOrders)
+        Why    : Reads existing Reservation (RI) orders from the Capacity API.
+                 Without this the script still runs but RI inventory and expiry
+                 dates will not be shown (Cost Management data still provides
+                 RI spend figures).
+
     Assign via Portal:
         Subscriptions / Management Groups → IAM → Add role assignment
         Billing Account → IAM → Billing Reader
+        Azure Portal → Reservations → Select reservation → IAM → Reservations Reader
 
     Assign via PowerShell (Cost Management Reader example):
         New-AzRoleAssignment -ObjectId <ObjectId> `
@@ -128,6 +143,8 @@ $ErrorActionPreference = 'Stop'
 #region ── Constants ──────────────────────────────────────────────────────────
 $SP_DISCOUNT_1YR = 0.37   # ~37% saving vs PAYG for 1-Year Compute SP
 $SP_DISCOUNT_3YR = 0.52   # ~52% saving vs PAYG for 3-Year Compute SP
+$RI_DISCOUNT_1YR = 0.40   # ~40% saving vs PAYG for 1-Year VM Reservation (indicative; varies by SKU/region)
+$RI_DISCOUNT_3YR = 0.60   # ~60% saving vs PAYG for 3-Year VM Reservation (indicative; varies by SKU/region)
 
 $COMPUTE_METER_CATEGORIES = @(
     'Virtual Machines',
@@ -314,12 +331,16 @@ if ($ManualExistingSpHourlyAUD -ge 0) {
 
         if ($relevantPlans.Count -gt 0) {
             Write-Host ""
-            Write-Host ("  {0,-36} {1,8} {2,12} {3,14} {4}" -f "Plan Name","Term","Hourly","Scope Type","Applied Scope")
-            Write-Host "  $('-' * 85)"
+            Write-Host ("  {0,-36} {1,8} {2,12} {3,14} {4,12} {5}" -f "Plan Name","Term","Hourly","Scope Type","Expiry Date","Applied Scope")
+            Write-Host "  $('-' * 100)"
             $relevantPlans | ForEach-Object {
                 $scopeDisplay = if ($_.AppliedScopes) { ($_.AppliedScopes -join ', ').Substring(0, [math]::Min(40, ($_.AppliedScopes -join ', ').Length)) } else { $_.AppliedScopeType }
-                Write-Host ("  {0,-36} {1,8} {2,12} {3,14} {4}" -f `
-                    $_.DisplayName, $_.Term, (Format-Currency $_.HourlyCommitment), $_.AppliedScopeType, $scopeDisplay)
+                $expiryDisplay = if ($_.ExpiryDate) { ([datetime]$_.ExpiryDate).ToString('yyyy-MM-dd') } else { 'Unknown' }
+                $daysLeft = if ($_.ExpiryDate) { ([datetime]$_.ExpiryDate - (Get-Date)).Days } else { $null }
+                $expiryColor = if ($null -ne $daysLeft -and $daysLeft -le 90) { 'Red' } elseif ($null -ne $daysLeft -and $daysLeft -le 180) { 'Yellow' } else { 'White' }
+                Write-Host ("  {0,-36} {1,8} {2,12} {3,14} {4,12} {5}" -f `
+                    $_.DisplayName, $_.Term, (Format-Currency $_.HourlyCommitment), $_.AppliedScopeType, $expiryDisplay, $scopeDisplay) `
+                    -ForegroundColor $expiryColor
             }
         }
 
@@ -327,9 +348,28 @@ if ($ManualExistingSpHourlyAUD -ge 0) {
             Write-Host ""
             Write-Host "  Subscription-scoped plans under this MG (informational — not summed):" -ForegroundColor DarkYellow
             $subLevelPlansUnderMg | ForEach-Object {
-                Write-Host ("    {0,-36} {1,8} {2,12}  Scope: {3}" -f `
-                    $_.DisplayName, $_.Term, (Format-Currency $_.HourlyCommitment), ($_.AppliedScopes -join ', '))
+                $expiryDisplay = if ($_.ExpiryDate) { ([datetime]$_.ExpiryDate).ToString('yyyy-MM-dd') } else { 'Unknown' }
+                $daysLeft = if ($_.ExpiryDate) { ([datetime]$_.ExpiryDate - (Get-Date)).Days } else { $null }
+                $expiryColor = if ($null -ne $daysLeft -and $daysLeft -le 90) { 'Red' } elseif ($null -ne $daysLeft -and $daysLeft -le 180) { 'Yellow' } else { 'DarkYellow' }
+                Write-Host ("    {0,-36} {1,8} {2,12}  Expiry: {3}  Scope: {4}" -f `
+                    $_.DisplayName, $_.Term, (Format-Currency $_.HourlyCommitment), $expiryDisplay, ($_.AppliedScopes -join ', ')) `
+                    -ForegroundColor $expiryColor
             }
+        }
+
+        # Warn about plans expiring within 90 days
+        $expiringPlans = $activePlans | Where-Object {
+            $_.ExpiryDate -and ([datetime]$_.ExpiryDate - (Get-Date)).Days -le 90
+        }
+        if ($expiringPlans.Count -gt 0) {
+            Write-Host ""
+            Write-Host "  ⚠  WARNING: The following Savings Plans expire within 90 days and will NOT auto-renew:" -ForegroundColor Red
+            $expiringPlans | ForEach-Object {
+                $daysLeft = ([datetime]$_.ExpiryDate - (Get-Date)).Days
+                Write-Host ("    {0,-36} Expiry: {1}  ({2} days)  Hourly: {3}" -f `
+                    $_.DisplayName, ([datetime]$_.ExpiryDate).ToString('yyyy-MM-dd'), $daysLeft, (Format-Currency $_.HourlyCommitment)) -ForegroundColor Red
+            }
+            Write-Host "  Action: Purchase replacement SPs before expiry to avoid a coverage gap." -ForegroundColor Red
         }
 
     } catch {
@@ -342,6 +382,133 @@ if ($ManualExistingSpHourlyAUD -ge 0) {
         Write-Host "  Impact  : Gap analysis will treat all remaining PAYG as uncovered." -ForegroundColor Yellow
         $existingSpHourly = 0.0
     }
+}
+#endregion
+
+#region ── Fetch Existing Reservations (Capacity API) ─────────────────────────
+Write-Section "Fetching Existing Reservations (RIs)"
+
+$existingRIs    = @()
+$riFetchWarning = $false
+
+try {
+    $riApiUri  = "https://management.azure.com/providers/Microsoft.Capacity/reservationOrders?api-version=2022-11-01&`$expand=reservations"
+    $riHeaders = @{ Authorization = "Bearer $token"; 'Content-Type' = 'application/json' }
+    $riResp    = Invoke-RestMethod -Method GET -Uri $riApiUri -Headers $riHeaders
+
+    $allRIs = @()
+    $riPage = $riResp
+    while ($riPage) {
+        foreach ($order in $riPage.value) {
+            $reservations = if ($order.PSObject.Properties['reservations']) { $order.reservations } else { @() }
+            foreach ($ri in $reservations) {
+                $allRIs += [PSCustomObject]@{
+                    OrderId              = $order.name
+                    ReservationId        = $ri.name
+                    DisplayName          = $ri.properties.displayName
+                    Status               = $ri.properties.provisioningState
+                    Term                 = $ri.properties.term               # P1Y / P3Y
+                    AppliedScopeType     = $ri.properties.appliedScopeType   # Shared / Single / ManagementGroup
+                    AppliedScopes        = $ri.properties.appliedScopes      # array of scope IDs
+                    Quantity             = [int]($ri.properties.quantity)
+                    SkuName              = $ri.sku.name
+                    ReservedResourceType = $ri.properties.reservedResourceType
+                    Location             = $ri.properties.location
+                    ExpiryDate           = $ri.properties.expiryDateTime
+                    InstanceFlexibility  = $ri.properties.instanceFlexibility
+                }
+            }
+        }
+        $riPage = if ($riPage.nextLink) { Invoke-RestMethod -Method GET -Uri $riPage.nextLink -Headers $riHeaders } else { $null }
+    }
+
+    $activeRIs = $allRIs | Where-Object { $_.Status -eq 'Succeeded' }
+
+    # Filter to RIs that cover this scope
+    $relevantRIs = $activeRIs | Where-Object {
+        $ri = $_
+        switch ($ri.AppliedScopeType) {
+            'Shared'          { $true }
+            'ManagementGroup' { $ri.AppliedScopes | Where-Object { $_ -match [regex]::Escape($scopeId) } }
+            'Single'          {
+                if ($scopeType -eq 'Subscription') {
+                    $ri.AppliedScopes | Where-Object { $_ -match [regex]::Escape($scopeId) }
+                } else {
+                    $false   # subscription-scoped RI under MG scope — informational only
+                }
+            }
+            default           { $false }
+        }
+    }
+
+    # Sub-level RIs under MG scope shown separately
+    $subLevelRIsUnderMg = @()
+    if ($scopeType -eq 'ManagementGroup') {
+        $subLevelRIsUnderMg = $activeRIs | Where-Object {
+            $_.AppliedScopeType -eq 'Single' -and ($relevantRIs -notcontains $_)
+        }
+    }
+
+    $existingRIs = $relevantRIs
+
+    Write-Host "  Total RI reservations found       : $($allRIs.Count)" -ForegroundColor Green
+    Write-Host "  RIs applicable to this scope      : $($relevantRIs.Count)" -ForegroundColor Green
+
+    if ($relevantRIs.Count -gt 0) {
+        Write-Host ""
+        Write-Host ("  {0,-34} {1,-22} {2,5} {3,5} {4,14} {5,12} {6}" -f "Display Name","SKU","Qty","Term","Scope Type","Expiry Date","Region")
+        Write-Host "  $('-' * 110)"
+        $relevantRIs | Sort-Object ExpiryDate | ForEach-Object {
+            $expiryDisplay = if ($_.ExpiryDate) { ([datetime]$_.ExpiryDate).ToString('yyyy-MM-dd') } else { 'Unknown' }
+            $daysLeft      = if ($_.ExpiryDate) { ([datetime]$_.ExpiryDate - (Get-Date)).Days } else { $null }
+            $color         = if ($null -ne $daysLeft -and $daysLeft -le 90)  { 'Red'    } `
+                        elseif ($null -ne $daysLeft -and $daysLeft -le 180) { 'Yellow' } `
+                        else                                                 { 'White'  }
+            Write-Host ("  {0,-34} {1,-22} {2,5} {3,5} {4,14} {5,12} {6}" -f `
+                $_.DisplayName, $_.SkuName, $_.Quantity, $_.Term, $_.AppliedScopeType, $expiryDisplay, $_.Location) `
+                -ForegroundColor $color
+        }
+    }
+
+    if ($subLevelRIsUnderMg.Count -gt 0) {
+        Write-Host ""
+        Write-Host "  Subscription-scoped RIs under this MG (informational — not aggregated):" -ForegroundColor DarkYellow
+        $subLevelRIsUnderMg | Sort-Object ExpiryDate | ForEach-Object {
+            $expiryDisplay = if ($_.ExpiryDate) { ([datetime]$_.ExpiryDate).ToString('yyyy-MM-dd') } else { 'Unknown' }
+            $daysLeft      = if ($_.ExpiryDate) { ([datetime]$_.ExpiryDate - (Get-Date)).Days } else { $null }
+            $color         = if ($null -ne $daysLeft -and $daysLeft -le 90)  { 'Red'    } `
+                        elseif ($null -ne $daysLeft -and $daysLeft -le 180) { 'Yellow' } `
+                        else                                                 { 'DarkYellow' }
+            Write-Host ("    {0,-34} {1,-22} Qty: {2}  {3}  Expiry: {4}  Scope: {5}" -f `
+                $_.DisplayName, $_.SkuName, $_.Quantity, $_.Term, $expiryDisplay,
+                ($_.AppliedScopes -join ', ')) -ForegroundColor $color
+        }
+    }
+
+    # Warn about RIs expiring within 90 days
+    $expiringRIs = $relevantRIs | Where-Object {
+        $_.ExpiryDate -and ([datetime]$_.ExpiryDate - (Get-Date)).Days -le 90
+    }
+    if ($expiringRIs.Count -gt 0) {
+        Write-Host ""
+        Write-Host "  ⚠  WARNING: The following Reservations expire within 90 days and will NOT auto-renew:" -ForegroundColor Red
+        $expiringRIs | ForEach-Object {
+            $daysLeft = ([datetime]$_.ExpiryDate - (Get-Date)).Days
+            Write-Host ("    {0,-34} SKU: {1,-20} Qty: {2}  Expiry: {3}  ({4} days)" -f `
+                $_.DisplayName, $_.SkuName, $_.Quantity,
+                ([datetime]$_.ExpiryDate).ToString('yyyy-MM-dd'), $daysLeft) -ForegroundColor Red
+        }
+        Write-Host "  Action: Renew or replace these reservations before expiry to avoid PAYG fallback." -ForegroundColor Red
+    }
+
+} catch {
+    $riFetchWarning = $true
+    Write-Host "  WARNING: Could not retrieve Reservations via Capacity API." -ForegroundColor Yellow
+    Write-Host "  Reason  : $($_.Exception.Message)" -ForegroundColor Yellow
+    Write-Host "  Action  : Ensure you have 'Reservations Reader' at the billing account or" -ForegroundColor Yellow
+    Write-Host "            Owner/Contributor on the individual reservations." -ForegroundColor Yellow
+    Write-Host "  Impact  : RI inventory and expiry dates will not be shown." -ForegroundColor Yellow
+    Write-Host "            RI spend figures from Cost Management are still used." -ForegroundColor Yellow
 }
 #endregion
 
@@ -464,6 +631,30 @@ $byRG = $paygRows | Group-Object ResourceGroupName | ForEach-Object {
         Percentage    = (($_.Group | Measure-Object -Property Cost -Sum).Sum / $totalPAYG) * 100
     }
 } | Sort-Object TotalCost -Descending | Select-Object -First 15
+
+# RI spend breakdown (from Cost Management RI rows)
+$riByCategory = $riCoveredRows | Group-Object MeterCategory | ForEach-Object {
+    [PSCustomObject]@{
+        MeterCategory = $_.Name
+        TotalCost     = ($_.Group | Measure-Object -Property Cost -Sum).Sum
+        Percentage    = if ($totalRICovered -gt 0) { (($_.Group | Measure-Object -Property Cost -Sum).Sum / $totalRICovered) * 100 } else { 0 }
+    }
+} | Sort-Object TotalCost -Descending
+
+$riByRG = $riCoveredRows | Group-Object ResourceGroupName | ForEach-Object {
+    [PSCustomObject]@{
+        ResourceGroup = $_.Name
+        TotalCost     = ($_.Group | Measure-Object -Property Cost -Sum).Sum
+        Percentage    = if ($totalRICovered -gt 0) { (($_.Group | Measure-Object -Property Cost -Sum).Sum / $totalRICovered) * 100 } else { 0 }
+    }
+} | Sort-Object TotalCost -Descending | Select-Object -First 10
+
+# RI PAYG-equivalent: convert RI discounted spend back to estimated PAYG-equivalent
+$avgRiDiscount      = ($RI_DISCOUNT_1YR + $RI_DISCOUNT_3YR) / 2
+$riCoveredPAYGEquiv = if ($totalRICovered -gt 0) { $totalRICovered / (1 - $avgRiDiscount) } else { 0 }
+
+# Total estimated PAYG-equivalent across all pricing models (for coverage % reporting)
+$totalComputePAYGEquiv = $totalPAYG + $spCoveredPAYGEquiv + $riCoveredPAYGEquiv
 #endregion
 
 #region ── GAP Calculation ────────────────────────────────────────────────────
@@ -521,10 +712,14 @@ Write-Host "  ── Compute Spend Breakdown (all pricing models) ──"
 Write-Host ("  Total Compute (PAYG + SP + RI)   : {0}" -f (Format-Currency $totalComputeAllPricing))
 Write-Host ("  ├─ PAYG (OnDemand) — uncovered   : {0}  ({1:N1}%)" -f `
     (Format-Currency $totalPAYG), (100 * $totalPAYG / [math]::Max(1,$totalComputeAllPricing)))
-Write-Host ("  ├─ Savings Plan covered          : {0}  ({1:N1}%)  [at discounted rate]" -f `
-    (Format-Currency $totalSPCovered), (100 * $totalSPCovered / [math]::Max(1,$totalComputeAllPricing)))
-Write-Host ("  └─ Reservation covered           : {0}  ({1:N1}%)  [at discounted rate]" -f `
-    (Format-Currency $totalRICovered), (100 * $totalRICovered / [math]::Max(1,$totalComputeAllPricing)))
+Write-Host ("  ├─ Savings Plan covered          : {0}  ({1:N1}%)  ≈ {2} PAYG-equiv" -f `
+    (Format-Currency $totalSPCovered),
+    (100 * $totalSPCovered / [math]::Max(1,$totalComputeAllPricing)),
+    (Format-Currency $spCoveredPAYGEquiv)) -ForegroundColor $(if ($totalSPCovered -gt 0) { 'Green' } else { 'White' })
+Write-Host ("  └─ Reservation covered           : {0}  ({1:N1}%)  ≈ {2} PAYG-equiv" -f `
+    (Format-Currency $totalRICovered),
+    (100 * $totalRICovered / [math]::Max(1,$totalComputeAllPricing)),
+    (Format-Currency $riCoveredPAYGEquiv)) -ForegroundColor $(if ($totalRICovered -gt 0) { 'Green' } else { 'White' })
 Write-Host ""
 Write-Host "  ── PAYG Hourly Baseline Analysis ──"
 Write-Host ("  Average Hourly PAYG              : {0}/hr" -f (Format-Currency $avgHourlyPAYG))
@@ -540,6 +735,31 @@ if ($spFetchWarning) {
         (Format-Currency $existingSpHourly), $existingSPs.Count) -ForegroundColor $(if ($existingSpHourly -gt 0) { 'Green' } else { 'DarkYellow' })
     Write-Host ("  Coverage of P50 Baseline         : {0:N1}%  {1}" -f `
         $existingCoverageOfP50Pct, (Get-PercentageBar $existingCoverageOfP50Pct))
+    $soonestSpExpiry = $existingSPs | Where-Object { $_.ExpiryDate } | Sort-Object { [datetime]$_.ExpiryDate } | Select-Object -First 1
+    if ($soonestSpExpiry) {
+        $spDaysLeft = ([datetime]$soonestSpExpiry.ExpiryDate - (Get-Date)).Days
+        $spExpiryColor = if ($spDaysLeft -le 90) { 'Red' } elseif ($spDaysLeft -le 180) { 'Yellow' } else { 'Green' }
+        Write-Host ("  Earliest SP Expiry               : {0}  ({1} days)" -f `
+            ([datetime]$soonestSpExpiry.ExpiryDate).ToString('yyyy-MM-dd'), $spDaysLeft) -ForegroundColor $spExpiryColor
+    }
+}
+Write-Host ""
+Write-Host "  ── Existing Reservation (RI) Position ──"
+if ($riFetchWarning) {
+    Write-Host "  RI inventory                     : UNKNOWN (API access insufficient)" -ForegroundColor Yellow
+    Write-Host ("  RI Covered Spend (Cost Mgmt)     : {0}  [at discounted rate]" -f (Format-Currency $totalRICovered))
+} else {
+    Write-Host ("  Active RIs (scope-applicable)    : {0} reservation(s)" -f $existingRIs.Count) `
+        -ForegroundColor $(if ($existingRIs.Count -gt 0) { 'Green' } else { 'DarkYellow' })
+    Write-Host ("  RI Covered Spend (Cost Mgmt)     : {0}  [at discounted rate]" -f (Format-Currency $totalRICovered)) `
+        -ForegroundColor $(if ($totalRICovered -gt 0) { 'Green' } else { 'White' })
+    $soonestRiExpiry = $existingRIs | Where-Object { $_.ExpiryDate } | Sort-Object { [datetime]$_.ExpiryDate } | Select-Object -First 1
+    if ($soonestRiExpiry) {
+        $riDaysLeft = ([datetime]$soonestRiExpiry.ExpiryDate - (Get-Date)).Days
+        $riExpiryColor = if ($riDaysLeft -le 90) { 'Red' } elseif ($riDaysLeft -le 180) { 'Yellow' } else { 'Green' }
+        Write-Host ("  Earliest RI Expiry               : {0}  ({1} days)" -f `
+            ([datetime]$soonestRiExpiry.ExpiryDate).ToString('yyyy-MM-dd'), $riDaysLeft) -ForegroundColor $riExpiryColor
+    }
 }
 Write-Host ""
 Write-Host "  ── Remaining GAP (Opportunity for Additional Savings Plans) ──"
@@ -555,6 +775,33 @@ $byCategory | ForEach-Object {
 Write-Section "Top Resource Groups by PAYG Compute"
 $byRG | ForEach-Object {
     Write-Host ("  {0,-42} {1,12}   {2:N1}%" -f $_.ResourceGroup, (Format-Currency $_.TotalCost), $_.Percentage)
+}
+
+Write-Section "Reservation (RI) Coverage — Spend Breakdown"
+if ($totalRICovered -eq 0) {
+    Write-Host "  No Reservation-covered compute spend found in this period." -ForegroundColor DarkYellow
+} else {
+    Write-Host ("  Total RI-Covered Spend (discounted rate) : {0}" -f (Format-Currency $totalRICovered))
+    Write-Host ("  Est. PAYG-Equivalent (before discount)   : {0}  [avg {1:N0}% RI discount applied]" -f `
+        (Format-Currency $riCoveredPAYGEquiv), ($avgRiDiscount * 100))
+    Write-Host ""
+    if ($riByCategory.Count -gt 0) {
+        Write-Host "  By Meter Category:"
+        $riByCategory | ForEach-Object {
+            Write-Host ("    {0,-35} {1,12}   {2}" -f $_.MeterCategory, (Format-Currency $_.TotalCost), (Get-PercentageBar $_.Percentage))
+        }
+    }
+    if ($riByRG.Count -gt 0) {
+        Write-Host ""
+        Write-Host "  Top Resource Groups (RI spend):"
+        $riByRG | ForEach-Object {
+            Write-Host ("    {0,-42} {1,12}   {2:N1}%" -f $_.ResourceGroup, (Format-Currency $_.TotalCost), $_.Percentage)
+        }
+    }
+    Write-Host ""
+    Write-Host "  Note: RI-covered rows in Cost Management show the discounted (post-RI) rate." -ForegroundColor DarkGray
+    Write-Host "  Discount rates vary by VM SKU, region, and term. Verify actual rates in the" -ForegroundColor DarkGray
+    Write-Host "  Azure Portal → Reservations → select reservation → Utilization." -ForegroundColor DarkGray
 }
 
 Write-Section "Additional Savings Plan Gap Model"
@@ -631,7 +878,12 @@ Write-Host "  1. Validate in Azure Portal: Cost Management → Savings Plans →
 Write-Host "     → Use the built-in 'Recommendations' tab for Microsoft's own suggestion."
 Write-Host "  2. Check Azure Advisor → Cost recommendations for Savings Plan alerts."
 Write-Host "  3. Review existing SP expiry dates and plan renewal before they lapse."
-Write-Host "  4. For Reservations (RI): run a separate RI analysis per VM SKU + region."
+Write-Host "  4. Review existing RI expiry dates: Azure Portal → Reservations → filter Expiry."
+Write-Host "     Plan RI renewals 60-90 days in advance (procurement lead-time)."
+Write-Host "  5. For new RI opportunities: Azure Portal → Cost Management → Reservations"
+Write-Host "     → 'Purchase recommendations' tab → filter by VM SKU + region."
+Write-Host "  6. SPs and RIs coexist: use RIs for stable, predictable SKU+region workloads;"
+Write-Host "     SPs for flexible or mixed-size compute that moves across regions/SKUs."
 #endregion
 
 #region ── CSV Export ─────────────────────────────────────────────────────────
@@ -640,14 +892,20 @@ if ($OutputCsvPath) {
     $paygPath  = "${OutputCsvPath}_PAYG_Detail.csv"
     $modelPath = "${OutputCsvPath}_Gap_Model.csv"
     $spPath    = "${OutputCsvPath}_ExistingSPs.csv"
+    $riPath    = "${OutputCsvPath}_ExistingRIs.csv"
+    $riSpendPath = "${OutputCsvPath}_RI_Spend_Detail.csv"
 
     $paygRows  | Export-Csv -Path $paygPath  -NoTypeInformation -Encoding UTF8
     $gapModels | Export-Csv -Path $modelPath -NoTypeInformation -Encoding UTF8
     if ($existingSPs.Count -gt 0) { $existingSPs | Export-Csv -Path $spPath -NoTypeInformation -Encoding UTF8 }
+    if ($existingRIs.Count -gt 0) { $existingRIs | Export-Csv -Path $riPath -NoTypeInformation -Encoding UTF8 }
+    if ($riCoveredRows.Count -gt 0) { $riCoveredRows | Export-Csv -Path $riSpendPath -NoTypeInformation -Encoding UTF8 }
 
     Write-Host "  PAYG detail       → $paygPath"  -ForegroundColor Green
     Write-Host "  Gap model         → $modelPath" -ForegroundColor Green
-    if ($existingSPs.Count -gt 0) { Write-Host "  Existing SPs      → $spPath" -ForegroundColor Green }
+    if ($existingSPs.Count -gt 0)    { Write-Host "  Existing SPs      → $spPath" -ForegroundColor Green }
+    if ($existingRIs.Count -gt 0)    { Write-Host "  Existing RIs      → $riPath" -ForegroundColor Green }
+    if ($riCoveredRows.Count -gt 0)  { Write-Host "  RI spend detail   → $riSpendPath" -ForegroundColor Green }
 }
 #endregion
 
